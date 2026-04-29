@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+*.html
+*.stl
+*.obj
+dist/
+build/
+venv/
+.venv/
+.claude/
+AI-md/
+reference/
+rhino-gh/
+CLAUDE.md
+*.pdf
