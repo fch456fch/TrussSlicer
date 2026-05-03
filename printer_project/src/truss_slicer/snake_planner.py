@@ -341,6 +341,7 @@ def plan_snake_paths(
     arc_z: float | None = None,
     max_arc_len: float = 20.0,
     rivet_len: float = 1.0,
+    last_end_z_hint: float | None = None,
 ) -> list[np.ndarray]:
     """PLACEHOLDER_CONTINUE"""
     if not grid_lines:
@@ -354,6 +355,9 @@ def plan_snake_paths(
     line_data, ring_buckets, lookup, visited = _build_boundary_data(boundaries, grid_lines)
     max_arc = max_arc_len
     result_paths: list[np.ndarray] = []
+
+    # 记录上一条路径终点的Z高度，用于同高度优先
+    last_end_z = last_end_z_hint
 
     while True:
         best_start_idx = -1
@@ -386,12 +390,24 @@ def plan_snake_paths(
             finally:
                 visited[idx] = False
 
-            if score_fwd > max_score:
-                max_score = score_fwd
+            # 同高度优先：起点Z与上一路径终点Z一致时加分
+            z_bonus_fwd = 0
+            z_bonus_bwd = 0
+            if last_end_z is not None and len(line_data[idx]["coords"]) >= 2:
+                coord = line_data[idx]["coords"]
+                z_start_fwd = float(coord[0, 2]) if coord.shape[1] > 2 else arc_z
+                z_start_bwd = float(coord[-1, 2]) if coord.shape[1] > 2 else arc_z
+                if z_start_fwd is not None and abs(z_start_fwd - last_end_z) < 0.1:
+                    z_bonus_fwd = 100
+                if z_start_bwd is not None and abs(z_start_bwd - last_end_z) < 0.1:
+                    z_bonus_bwd = 100
+
+            if score_fwd + z_bonus_fwd > max_score:
+                max_score = score_fwd + z_bonus_fwd
                 best_start_idx = idx
                 best_is_forward = True
-            if score_bwd > max_score:
-                max_score = score_bwd
+            if score_bwd + z_bonus_bwd > max_score:
+                max_score = score_bwd + z_bonus_bwd
                 best_start_idx = idx
                 best_is_forward = False
 
@@ -479,5 +495,8 @@ def plan_snake_paths(
                 if rivet_len > 0:
                     path = _add_rivets(path, boundaries, rivet_len, arc_z)
                 result_paths.append(path)
+                # 更新上一条路径终点的Z高度，用于下一条路径的同高度优先选择
+                if path.shape[1] > 2:
+                    last_end_z = float(path[-1, 2])
 
     return result_paths

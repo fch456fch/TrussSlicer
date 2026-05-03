@@ -20,6 +20,9 @@ from .snake_planner import GridLine
 class TrussGridResult:
     bottom_lines: list[GridLine] = field(default_factory=list)
     top_lines: list[GridLine] = field(default_factory=list)
+    low_stubs: list[tuple[np.ndarray, str]] = field(default_factory=list)
+    high_stubs: list[tuple[np.ndarray, str]] = field(default_factory=list)
+    edge_lines: list[np.ndarray] = field(default_factory=list)
 
 
 def _is_inside(polygon: Polygon | MultiPolygon, x: float, y: float) -> bool:
@@ -35,6 +38,82 @@ def _is_boundary_node(polygon: Polygon | MultiPolygon, x: float, y: float, spaci
 
 def _node_z(i: int, j: int, k: int, z_low: float, z_high: float) -> float:
     return z_low if (i + j + k) % 2 == 0 else z_high
+
+
+def _merge_dead_endpoints(lines: list[GridLine]) -> list[GridLine]:
+    """
+    合并同组内方向不同但共享 dead 点的线段。
+    例如：X 方向线 dead_end 于 P，Y 方向线 dead_start 于 P → 合并为一条折线。
+    同时支持双向扩展。
+    """
+    if not lines:
+        return lines
+
+    # 建立坐标到线段的映射
+    start_map: dict[tuple[float, float], list[int]] = {}
+    end_map: dict[tuple[float, float], list[int]] = {}
+
+    for i, gl in enumerate(lines):
+        if gl.dead_start:
+            key = (round(gl.start[0], 3), round(gl.start[1], 3))
+            start_map.setdefault(key, []).append(i)
+        if gl.dead_end:
+            key = (round(gl.end[0], 3), round(gl.end[1], 3))
+            end_map.setdefault(key, []).append(i)
+
+    merged: set[int] = set()
+    result: list[GridLine] = []
+
+    for i, gl in enumerate(lines):
+        if i in merged:
+            continue
+
+        merged.add(i)
+        current_gl = gl
+
+        # 向前扩展：current_gl.dead_end -> other.dead_start
+        while True:
+            end_key = (round(current_gl.end[0], 3), round(current_gl.end[1], 3))
+            found = False
+            for j in start_map.get(end_key, []):
+                if j in merged:
+                    continue
+                other = lines[j]
+                if other.direction != current_gl.direction:
+                    merged.add(j)
+                    current_gl = _concat_lines(current_gl, other)
+                    found = True
+                    break
+            if not found:
+                break
+
+        # 向后扩展：other.dead_end -> current_gl.dead_start
+        while True:
+            start_key = (round(current_gl.start[0], 3), round(current_gl.start[1], 3))
+            found = False
+            for j in end_map.get(start_key, []):
+                if j in merged:
+                    continue
+                other = lines[j]
+                if other.direction != current_gl.direction:
+                    merged.add(j)
+                    current_gl = _concat_lines(other, current_gl)
+                    found = True
+                    break
+            if not found:
+                break
+
+        result.append(current_gl)
+
+    return result
+
+
+def _concat_lines(gl_a: GridLine, gl_b: GridLine) -> GridLine:
+    """将 gl_b 连接到 gl_a 的末端，返回新线段（清除 dead 标记）。"""
+    coords_a = gl_a.coords
+    coords_b = gl_b.coords
+    combined = np.vstack([coords_a, coords_b[1:]])
+    return GridLine(coords=combined, direction=gl_a.direction, dead_start=False, dead_end=False)
 
 
 def _classify_and_split(
@@ -61,6 +140,10 @@ def _classify_and_split(
             result.top_lines.append(gl)
         else:
             _split_mixed(gl, z_low, z_mid, result)
+
+    # 合并 bottom/top 组内有相同 dead 点但方向不同的线段
+    result.bottom_lines = _merge_dead_endpoints(result.bottom_lines)
+    result.top_lines = _merge_dead_endpoints(result.top_lines)
 
     return result
 
@@ -100,6 +183,27 @@ def _split_mixed(gl: GridLine, z_low: float, z_mid: float, result: TrussGridResu
             result.bottom_lines.append(GridLine(coords=part_b, direction=gl.direction, dead_start=True))
         else:
             result.top_lines.append(GridLine(coords=part_b, direction=gl.direction, dead_start=True))
+
+
+def _extract_stubs(
+    pts_3d: np.ndarray, z_mid: float,
+    low_stubs: list[tuple[np.ndarray, str]],
+    high_stubs: list[tuple[np.ndarray, str]],
+    direction: str,
+) -> None:
+    """提取桁架线首尾的边界碎线（2D），统一为 [internal, boundary] 方向。"""
+    if len(pts_3d) < 3:
+        return
+    stub_s = pts_3d[:2, :2][::-1].copy()
+    if pts_3d[1, 2] < z_mid:
+        low_stubs.append((stub_s, direction))
+    else:
+        high_stubs.append((stub_s, direction))
+    stub_e = pts_3d[-2:, :2].copy()
+    if pts_3d[-2, 2] < z_mid:
+        low_stubs.append((stub_e, direction))
+    else:
+        high_stubs.append((stub_e, direction))
 
 
 def generate_truss_grid(
@@ -144,6 +248,10 @@ def generate_truss_grid(
     end_j = int(math.ceil((maxy - oy) / spacing)) + 1
 
     raw_lines: list[GridLine] = []
+    low_stubs: list[tuple[np.ndarray, str]] = []
+    high_stubs: list[tuple[np.ndarray, str]] = []
+    edge_lines: list[np.ndarray] = []
+    z_mid = (z_low + z_high) / 2
     k = cell_index
 
     # X 方向线（y 固定，j 固定）
@@ -170,10 +278,27 @@ def generate_truss_grid(
                     z = _node_z(i, j, k, z_low, z_high)
                     internal_pts.append([x, y, z])
 
-            # n_spacing = 经过的 spacing 数量（向下取整）
-            # n_spacing <= 2：跳过，避免 low-high 跨接问题
             n_spacing = len(internal_pts)
-            if n_spacing <= 2:
+            if n_spacing == 0:
+                # 纯边界线，只加入 edge_lines，不进入 truss body
+                z_near = _node_z(i_min, j, k, z_low, z_high)
+                pts_3d = rotate_back_3d([
+                    [p_s[0], p_s[1], z_near], [p_e[0], p_e[1], z_near],
+                ])
+                arr = np.array(pts_3d)
+                edge_lines.append(arr[:, :2].copy())
+                continue
+            if n_spacing == 1:
+                z_only = internal_pts[0][2]
+                pts_3d = [[p_s[0], p_s[1], z_only]]
+                pts_3d.extend(internal_pts)
+                pts_3d.append([p_e[0], p_e[1], z_only])
+                pts_3d = rotate_back_3d(pts_3d)
+                arr = np.array(pts_3d)
+                raw_lines.append(GridLine(coords=arr, direction="X"))
+                _extract_stubs(arr, z_mid, low_stubs, high_stubs, "X")
+                continue
+            if n_spacing == 2:
                 continue
 
             # 端点 Z 继承最近内部节点
@@ -186,7 +311,9 @@ def generate_truss_grid(
 
             if len(pts_3d) >= 2:
                 pts_3d = rotate_back_3d(pts_3d)
-                raw_lines.append(GridLine(coords=np.array(pts_3d), direction="X"))
+                arr = np.array(pts_3d)
+                raw_lines.append(GridLine(coords=arr, direction="X"))
+                _extract_stubs(arr, z_mid, low_stubs, high_stubs, "X")
 
     # Y 方向线（x 固定，i 固定）
     for i in range(start_i, end_i + 1):
@@ -212,10 +339,27 @@ def generate_truss_grid(
                     z = _node_z(i, j, k, z_low, z_high)
                     internal_pts.append([x, y, z])
 
-            # n_spacing = 经过的 spacing 数量（向下取整）
-            # n_spacing <= 2：跳过，避免 low-high 跨接问题
             n_spacing = len(internal_pts)
-            if n_spacing <= 2:
+            if n_spacing == 0:
+                # 纯边界线，只加入 edge_lines，不进入 truss body
+                z_near = _node_z(i, j_min, k, z_low, z_high)
+                pts_3d = rotate_back_3d([
+                    [p_s[0], p_s[1], z_near], [p_e[0], p_e[1], z_near],
+                ])
+                arr = np.array(pts_3d)
+                edge_lines.append(arr[:, :2].copy())
+                continue
+            if n_spacing == 1:
+                z_only = internal_pts[0][2]
+                pts_3d = [[p_s[0], p_s[1], z_only]]
+                pts_3d.extend(internal_pts)
+                pts_3d.append([p_e[0], p_e[1], z_only])
+                pts_3d = rotate_back_3d(pts_3d)
+                arr = np.array(pts_3d)
+                raw_lines.append(GridLine(coords=arr, direction="Y"))
+                _extract_stubs(arr, z_mid, low_stubs, high_stubs, "Y")
+                continue
+            if n_spacing == 2:
                 continue
 
             # 端点 Z 继承最近内部节点
@@ -228,9 +372,15 @@ def generate_truss_grid(
 
             if len(pts_3d) >= 2:
                 pts_3d = rotate_back_3d(pts_3d)
-                raw_lines.append(GridLine(coords=np.array(pts_3d), direction="Y"))
+                arr = np.array(pts_3d)
+                raw_lines.append(GridLine(coords=arr, direction="Y"))
+                _extract_stubs(arr, z_mid, low_stubs, high_stubs, "Y")
 
-    return _classify_and_split(raw_lines, z_low, z_high)
+    result = _classify_and_split(raw_lines, z_low, z_high)
+    result.low_stubs = low_stubs
+    result.high_stubs = high_stubs
+    result.edge_lines = edge_lines
+    return result
 
 
 def _extract_segments(geom) -> list:

@@ -10,8 +10,29 @@ from shapely.geometry import LinearRing
 from . import mesh_loader, preview, slicer
 from .layer_classifier import classify_layers
 from .region_builder import build_layer_regions
-from .snake_planner import generate_grid_lines, generate_parallel_lines, plan_snake_paths, GridLine
+from .snake_planner import generate_grid_lines, generate_parallel_lines, plan_snake_paths
 from .truss_grid import generate_truss_grid
+
+
+from . import geometry_utils as gu
+from .stubs_sorter import plan_stub_paths_sorted
+
+
+def _append_stubs_and_edges(
+    stubs: list[tuple[np.ndarray, str]],
+    edge_lines: list[np.ndarray],
+    boundaries: list[LinearRing],
+    layer,
+    all_layer_paths: list,
+) -> None:
+    """将 stub 路径和 edge_lines 按边界环 CW 顺序添加到当前层。"""
+    lp = preview.LayerPaths(index=layer.index, z=layer.z, kind="truss_stub")
+    if (stubs or edge_lines) and boundaries:
+        for p in plan_stub_paths_sorted(stubs, boundaries, edge_lines, rivet_len=1.0):
+            zs = np.full((len(p), 1), layer.z)
+            lp.paths.append(np.hstack([p, zs]))
+    if lp.paths:
+        all_layer_paths.append(lp)
 
 
 @click.command()
@@ -70,6 +91,8 @@ def main(
     all_layer_paths: list[preview.LayerPaths] = []
     # truss_body_high 需要延迟到目标层侧墙之后插入
     deferred_high: dict[int, list[preview.LayerPaths]] = {}
+    # 每个桁架单元的边界碎线 + edge_lines + 起始层索引
+    cell_stubs: dict[int, tuple[list, list, list[np.ndarray], int]] = {}
 
     for layer in layers:
         lb = label_map.get(layer.index)
@@ -116,7 +139,7 @@ def main(
 
         elif lb.kind == "sparse_infill":
             # 余数层：20% 密度传统网格（间距 = line_width / 0.2 = 5 倍线宽）
-            sparse_spacing = line_width / 0.2
+            sparse_spacing = line_width / 0.16
             sparse_angle = 45.0 if (layer.index % 2 == 0) else 135.0
             grid = generate_parallel_lines(regions.infill_region, spacing=sparse_spacing, angle=sparse_angle)
             paths = plan_snake_paths(grid, boundaries)
@@ -130,6 +153,10 @@ def main(
                 z_low=z_low, z_high=z_high,
                 cell_index=lb.cell_index,
                 angle=infill_angle,
+            )
+            cell_stubs[lb.cell_index] = (
+                truss_result.low_stubs, truss_result.high_stubs,
+                truss_result.edge_lines, layer.index,
             )
             # 底部蛇形
             if truss_result.bottom_lines:
@@ -153,7 +180,34 @@ def main(
                         p = np.hstack([p, zs])
                     lp_high.paths.append(p)
                 deferred_high.setdefault(anchor_idx, []).append(lp_high)
+            # low 层追加 high 碎线 + edge_lines
+            _append_stubs_and_edges(
+                truss_result.high_stubs, truss_result.edge_lines,
+                boundaries, layer, all_layer_paths,
+            )
             continue
+
+        elif lb.kind == "truss_body_skip":
+            # Stubs 分布规则（cell_index 相同时）：
+            #   rel=0 (truss_body_start):    high_stubs + edge_lines
+            #   0 < rel < high_rel (skip):   low_stubs + high_stubs + edge_lines
+            #   rel=high_rel (anchor 前层):  low_stubs + edge_lines
+            #   rel=high_rel+1 (anchor 层):  无 stubs
+            info = cell_stubs.get(lb.cell_index)
+            if info:
+                low_s, high_s, edges, start_idx = info
+                rel = layer.index - start_idx
+                high_rel = truss_cell_layers - 2
+                use_stubs: list[tuple[np.ndarray, str]] = []
+                if rel > 0:
+                    use_stubs.extend(low_s)
+                if rel < high_rel:
+                    use_stubs.extend(high_s)
+                _append_stubs_and_edges(
+                    use_stubs, edges, boundaries, layer, all_layer_paths,
+                )
+            continue
+
         else:
             continue
 

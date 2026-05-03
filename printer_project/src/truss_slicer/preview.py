@@ -16,12 +16,13 @@ KIND_COLORS = {
     "truss_anchor": "#1f77b4",
     "truss_body_low": "#2ca02c",
     "truss_body_high": "#d62728",
+    "truss_stub": "#9467bd",
     "wall": "#000000",
     "contour": "#aaaaaa",
 }
 
 MARKER_KINDS = {"bottom_solid", "top_solid", "sparse_infill", "truss_anchor",
-                "truss_body_low", "truss_body_high"}
+                "truss_body_low", "truss_body_high", "truss_stub"}
 
 
 @dataclass
