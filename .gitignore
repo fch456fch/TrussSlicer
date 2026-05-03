@@ -16,3 +16,9 @@ __pycache__/
 
 # Build output
 *.html
+
+# External directories (not part of this repo)
+AI-md/
+memory/
+reference/
+rhino-gh/
