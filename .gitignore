@@ -1,17 +1,18 @@
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
 *.egg-info/
-.pytest_cache/
-*.html
+*.egg
+*.deb
+*.whl
+
+# Test fixtures
 *.stl
-*.obj
-dist/
-build/
-venv/
-.venv/
+
+# IDE
 .claude/
-AI-md/
-reference/
-rhino-gh/
-CLAUDE.md
-*.pdf
+.vscode/
+*.swp
+
+# Build output
+*.html
